@@ -10,6 +10,72 @@ on:
     types: [requested]
 
 jobs:
+  get-test-definition-files:
+    name: Get Test Definition Files
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.get-test-definition-files.outputs.result }}
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.18.x
+
+      - name: Add GOBIN to PATH
+        run: echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+        shell: bash
+
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+        with:
+          repository: newrelic/open-install-library
+          path: open-install-library
+
+      - name: Install Snapcraft
+        uses: samuelmeuli/action-snapcraft@v2
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_TOKEN }}
+
+      - name: Get Test Definition Files
+        id: get-test-definition-files
+        uses: actions/github-script@v3
+        with:
+          script: |
+            const fs = require("fs");
+            const fsp = fs.promises;
+            const path = require("path");
+
+            // readdir recursive directory search
+            const { readdir } = fsp;
+            async function getFiles(dir) {
+              const dirents = await readdir(dir, { withFileTypes: true });
+              const files = await Promise.all(
+                dirents.map((dirent) => {
+                  const res = path.join(dir, dirent.name);
+                  return dirent.isDirectory() ? getFiles(res) : res;
+                })
+              );
+              return Array.prototype.concat(...files);
+            }
+
+            const testDefinitions = await getFiles(`${process.env.GITHUB_WORKSPACE}/open-install-library/test/definitions/smoke`);
+
+            const outputTestFilesMap = testDefinitions
+              .map((testDefinitionFile) => {
+                return {
+                  testDefinitionFile,
+                  testDisplayName: testDefinitionFile.split("/").pop(),
+                };
+              });
+            const output = {
+              include: outputTestFilesMap,
+            };
+            console.log(output);
+            return output;
+
   validate-all:
     name: Validate All
     runs-on: ubuntu-latest
@@ -37,12 +103,6 @@ jobs:
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_TOKEN }}
 
-      - name: Install PGP private key
-        shell: bash
-        env:
-          PGP_PRIVATE_KEY: ${{ secrets.PGP_PRIVATE_KEY }}
-        run: echo "$PGP_PRIVATE_KEY" | gpg --batch --import
-
       - name: Compile all distros
         continue-on-error: true
         env:
@@ -63,6 +123,8 @@ jobs:
         id: add-newrelic-cli-path-smoke-tests
         uses: actions/github-script@v6
         continue-on-error: false
+        outputs:
+          matrix: ${{ steps.add-newrelic-cli-path-smoke-tests.outputs.result }}
         with:
           script: |
             const fs = require('fs');
@@ -148,7 +210,15 @@ jobs:
               }
             });
 
-            return null;
+
+            const outputTestFilesMap = testFiles.map(testDefinitionFile => {
+                return { testDefinitionFile, 'testDisplayName': testDefinitionFile.split("/").pop() }
+            })
+            const output = {
+                "include": outputTestFilesMap
+            }
+            console.log(output);
+            return output;
 
       - name: Write AWS Certificate to File
         env:
@@ -172,9 +242,26 @@ jobs:
 
       - name: Run deployer
         run: |
+          set -e
+          testDefinitionFile=$(echo $MATRIX | jq -c -r '.testDefinitionFile')
+          echo $testDefinitionFile
           docker run -i\
             -v ${{ github.workspace }}/configs/:/mnt/deployer/configs/\
             -v ${{ github.workspace }}/open-install-library/test/:/mnt/deployer/test/\
             -v ${{ github.workspace }}/bin/:/mnt/deployer/bin/\
             -v ${{ github.workspace }}/dist/:/mnt/deployer/dist/\
-            --entrypoint ruby ghcr.io/newrelic/deployer:latest batch.rb -c configs/gitusdkrnrcli${{ github.run_id }}.json -d test/definitions/smoke -s 20 -m deploy -l debug
+            --entrypoint ruby ghcr.io/newrelic/deployer:latest main.rb -c configs/gitusdkrnrcli${{ github.run_id }}.json -d $testDefinitionFile -l debug
+          echo ::set-output name=exit_status::$?
+
+      - name: Teardown any previous deployment
+        if: always()
+        id: cleanupResources
+        continue-on-error: true
+        run: |
+          testDefinitionFile=$(echo $MATRIX | jq -c -r '.testDefinitionFile')
+          echo $testDefinitionFile
+          docker run \
+            -v ${{ github.workspace }}/configs/:/mnt/deployer/configs/\
+            -v ${{ github.workspace }}/test/:/mnt/deployer/test/\
+            --entrypoint ruby ghcr.io/newrelic/deployer:latest main.rb -c configs/gitusdkrnrcli${{ github.run_id }}.json -d $testDefinitionFile -t
+            --entrypoint ruby ghcr.io/newrelic/deployer:latest main.rb -c configs/gitusdkreu${{ github.run_id }}.json -d $testDefinitionFile -t
